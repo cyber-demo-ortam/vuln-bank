@@ -27,9 +27,13 @@ spec:
       labels:
         app: vuln-bank-web
     spec:
+      initContainers:
+        - name: wait-for-postgres
+          image: postgres:13
+          command: ['sh', '-c', 'until pg_isready -h db -p 5432; do echo "waiting for postgres..."; sleep 2; done']
       containers:
         - name: web
-          image: vulnbank-web:latest
+          image: vuln-bank-web:latest
           imagePullPolicy: IfNotPresent
           ports:
             - containerPort: 5000
@@ -69,10 +73,31 @@ metadata:
   name: vuln-bank-web
   namespace: vuln-bank
 spec:
-  type: LoadBalancer
+  type: ClusterIP
   selector:
     app: vuln-bank-web
   ports:
     - name: http
       port: 80
       targetPort: 5000
+
+---
+
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: vuln-bank-ingress
+  namespace: vuln-bank
+  annotations:
+    traefik.ingress.kubernetes.io/router.entrypoints: web
+spec:
+  rules:
+    - http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: vuln-bank-web
+                port:
+                  number: 80
