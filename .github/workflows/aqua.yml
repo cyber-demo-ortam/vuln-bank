@@ -1,38 +1,82 @@
-name: Build & Aqua Scan (Web Only)
+name: Build & Aqua Full Security Scan
 
 on:
   push:
     branches:
       - main
+  pull_request:
   workflow_dispatch:
 
 jobs:
-  build-and-scan:
+  security:
+    name: Build + Aqua Full Scan
     runs-on: ubuntu-latest
 
     steps:
+      # ----------------------------------
+      # 1️⃣ Checkout
+      # ----------------------------------
       - name: Checkout code
         uses: actions/checkout@v4
 
-      # -------------------------
-      # 1️⃣ Build only web service
-      # -------------------------
+      # ----------------------------------
+      # 2️⃣ Build Web Container
+      # ----------------------------------
       - name: Build Web Service
         run: |
           docker compose build web
 
-      # -------------------------
-      # 2️⃣ Install Billy (no checksum)
-      # -------------------------
+      # ----------------------------------
+      # 3️⃣ Aqua Trivy Filesystem Scan
+      # ----------------------------------
+      - name: Trivy FS Scan
+        uses: docker://aquasec/aqua-scanner
+        with:
+          args: >
+            trivy fs
+            --scanners misconfig,vuln,secret
+            --severity UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL
+            --sast
+            --reachability
+            .
+        env:
+          AQUA_KEY: ${{ secrets.AQUA_KEY }}
+          AQUA_SECRET: ${{ secrets.AQUA_SECRET }}
+          GITHUB_TOKEN: ${{ github.token }}
+          AQUA_URL: https://api.eu-1.supply-chain.cloud.aquasec.com
+          CSPM_URL: https://eu-1.api.cloudsploit.com
+          TRIVY_RUN_AS_PLUGIN: 'aqua'
+
+      # ----------------------------------
+      # 4️⃣ Aqua Trivy Image Scan
+      # ----------------------------------
+      - name: Trivy Image Scan
+        uses: docker://aquasec/aqua-scanner
+        with:
+          args: >
+            trivy image
+            --severity UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL
+            vulnbank-web:latest
+        env:
+          AQUA_KEY: ${{ secrets.AQUA_KEY }}
+          AQUA_SECRET: ${{ secrets.AQUA_SECRET }}
+          GITHUB_TOKEN: ${{ github.token }}
+          AQUA_URL: https://api.eu-1.supply-chain.cloud.aquasec.com
+          CSPM_URL: https://eu-1.api.cloudsploit.com
+          TRIVY_RUN_AS_PLUGIN: 'aqua'
+
+      # ----------------------------------
+      # 5️⃣ Install Billy
+      # ----------------------------------
       - name: Install Billy
         run: |
           export BILLY_SERVER=https://billy.eu-1.codesec.aquasec.com
           curl -sL https://download.codesec.aquasec.com/billy/install.sh | BINDIR="." sh
 
-      # -------------------------
-      # 3️⃣ Scan Web Image
-      # -------------------------
-      - name: Scan Web Image
+      # ----------------------------------
+      # 6️⃣ Billy Image Scan
+      # ----------------------------------
+      - name: Billy Scan - Docker Image
         run: |
           export BILLY_SERVER=https://billy.eu-1.codesec.aquasec.com
 
