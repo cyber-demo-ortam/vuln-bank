@@ -24,6 +24,10 @@ import hashlib
 import traceback
 import yaml
 import logging
+# Top-level imports required for reachability analysis (Aqua/Trivy traces import graph)
+from Crypto.Cipher import AES as _AES          # pycrypto CVE-2013-7459 (CRITICAL, no fix)
+from PIL import Image, ImageMath               # Pillow  CVE-2022-22817 (CRITICAL RCE)
+from lxml import etree as _etree              # lxml    CVE-2021-43818 (HIGH XSS/path traversal)
 
 # Load environment variables
 load_dotenv()
@@ -2255,6 +2259,10 @@ def register_v2():
     if not username or not password:
         return jsonify({'status': 'error', 'message': 'Username and password required'}), 400
     md5_hash = hashlib.md5(password.encode()).hexdigest()
+    # A04: Weak AES-ECB encryption with hardcoded key (pycrypto CVE-2013-7459)
+    cipher = _AES.new(HARDCODED_ENCRYPTION_KEY.ljust(16, b'\x00')[:16], _AES.MODE_ECB)
+    padded = password.encode().ljust(16, b'\x00')[:16]
+    encrypted_pw = base64.b64encode(cipher.encrypt(padded)).decode()
     account_number = generate_account_number()
     existing = execute_query("SELECT id FROM users WHERE username = %s", (username,))
     if existing and existing[0]:
@@ -2274,6 +2282,7 @@ def register_v2():
         'account_number': u[2],
         'password_hash': md5_hash,
         'hash_algorithm': 'MD5 (unsalted)',
+        'password_encrypted_aes_ecb': encrypted_pw,
         'hardcoded_encryption_key': HARDCODED_ENCRYPTION_KEY.hex(),
         'note': 'Crack with: hashcat -a 0 -m 0 hash.txt rockyou.txt',
     })
@@ -2650,10 +2659,9 @@ def parse_xml():
         <!DOCTYPE foo [<!ENTITY xxe SYSTEM "http://169.254.169.254/latest/meta-data/">]>
     """
     try:
-        from lxml import etree
-        parser = etree.XMLParser(resolve_entities=True, load_dtd=True, no_network=False)
-        root   = etree.fromstring(request.data, parser=parser)
-        return jsonify({'status': 'parsed', 'result': etree.tostring(root, encoding='unicode')})
+        parser = _etree.XMLParser(resolve_entities=True, load_dtd=True, no_network=False)
+        root   = _etree.fromstring(request.data, parser=parser)
+        return jsonify({'status': 'parsed', 'result': _etree.tostring(root, encoding='unicode')})
     except Exception as e:
         return jsonify({
             'status': 'error', 'message': str(e),
@@ -2674,7 +2682,6 @@ def process_image():
         {"operation": "__import__('subprocess').check_output(['cat','/etc/passwd']).decode()"}
     """
     try:
-        from PIL import Image, ImageMath
         data      = request.get_json() or {}
         operation = data.get('operation', '0')
         width     = int(data.get('width',  100))

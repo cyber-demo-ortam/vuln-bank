@@ -1,8 +1,11 @@
 FROM python:3.9-slim
 
-# Install PostgreSQL client
+# Install build tools (required for pycrypto C extension) and PostgreSQL client
 RUN apt-get update && apt-get install -y \
     postgresql-client \
+    gcc \
+    python3-dev \
+    autoconf \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
