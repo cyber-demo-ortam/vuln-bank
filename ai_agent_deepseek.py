@@ -19,8 +19,8 @@ class VulnerableAIAgent:
     """
     
     def __init__(self):
-        self.api_key = os.getenv('DEEPSEEK_API_KEY', 'demo-key')
-        self.api_url = "https://api.deepseek.com/chat/completions"
+        self.api_key = os.getenv('DEEPSEEK_API_KEY')
+        self.api_url = "https://api.deepseek.com/v1/chat/completions"
         self.model = "deepseek-chat"
         
         # VULNERABILITY: System prompt can be extracted and is overly permissive

