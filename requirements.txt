@@ -8,3 +8,11 @@ python-dotenv==1.0.0
 requests==2.31.0
 # A03: Supply Chain — CVE-2020-14343 (CVSS 9.8): yaml.load() with full Loader = RCE
 PyYAML==5.3.1
+# CVE-2022-22817 (CVSS 9.8 CRITICAL): PIL.ImageMath.eval() allows arbitrary code execution
+Pillow==9.0.0
+# CVE-2013-7459 (CVSS 9.8 CRITICAL): heap buffer overflow / AES key handling = RCE
+pycrypto==2.6.1
+# CVE-2021-43818 (CVSS 8.8 HIGH): XSS + path traversal via crafted SVG/HTML in lxml
+lxml==4.6.1
+# CVE-2022-42969 (no vendor fix / affected): ReDoS + RCE via crafted Subversion repo URL
+py==1.11.0
