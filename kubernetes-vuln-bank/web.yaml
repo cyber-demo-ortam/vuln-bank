@@ -28,6 +28,13 @@ spec:
         app: vuln-bank-web
     spec:
       initContainers:
+        - name: init-uploads
+          image: vuln-bank-web:latest
+          imagePullPolicy: IfNotPresent
+          command: ['sh', '-c', 'cp -rn /app/static/uploads/. /mnt/uploads/']
+          volumeMounts:
+            - name: uploads
+              mountPath: /mnt/uploads
         - name: wait-for-postgres
           image: postgres:13
           command: ['sh', '-c', 'until pg_isready -h db -p 5432; do echo "waiting for postgres..."; sleep 2; done']
